@@ -1,0 +1,110 @@
+WITH patients AS (
+  SELECT DISTINCT
+    pat.subject_id, 
+    adm.hadm_id,
+    icu.stay_id,
+    adm.admittime,
+    icu.intime ICU_IN_TIME,
+    icu.outtime ICU_OUT_TIME,
+    adm.hospital_expire_flag,
+    if (icu.stay_id is not null, true, false) AS icu_stay,
+    pat.gender,
+    pat.anchor_age,
+    case
+      when icu.stay_id is not null then DATE_DIFF(icu.intime, adm.admittime, DAY)
+      when icu.stay_id is null then null end as ICU_IN_INTERVAL,
+    case
+      when pat.dod is not null then DATE_DIFF(pat.dod, adm.admittime, DAY)
+      when pat.dod is null then null end as ADM_DEATH_INTERVAL,
+    case
+      when adm.dischtime is not null then DATE_DIFF(adm.dischtime, adm.admittime, DAY)
+      when adm.dischtime is null then null end
+    as LOS,
+    adm.admission_type,
+    adm.admission_location,
+    adm.discharge_location,
+    adm.language,
+    adm.insurance,
+    adm.race,
+    adm.marital_status
+  FROM `physionet-data.mimiciv_hosp.patients` pat
+  JOIN `physionet-data.mimiciv_hosp.admissions` adm ON pat.subject_id = adm.subject_id
+  LEFT JOIN `physionet-data.mimiciv_icu.icustays` icu ON adm.hadm_id = icu.hadm_id
+),
+
+flag_labs AS (
+  SELECT 
+    pa.subject_id, 
+    pa.hadm_id,
+    COUNT(DISTINCT icu_la.labevent_id) AS ICU_ABN_LAB,
+    COUNT(DISTINCT hadm_la.labevent_id) AS PRE_ICU_ABN_LAB
+  FROM patients pa
+  LEFT JOIN `physionet-data.mimiciv_icu.icustays` icu ON pa.hadm_id = icu.hadm_id
+  LEFT JOIN `physionet-data.mimiciv_hosp.labevents` icu_la 
+    ON icu.hadm_id = icu_la.hadm_id
+   AND icu_la.charttime BETWEEN icu.intime AND icu.outtime
+   AND icu_la.flag = 'abnormal'
+  LEFT JOIN `physionet-data.mimiciv_hosp.labevents` hadm_la 
+    ON pa.hadm_id = hadm_la.hadm_id
+   AND (hadm_la.charttime < icu.intime or icu.stay_id is null)
+   AND hadm_la.flag = 'abnormal'
+  GROUP BY pa.subject_id, pa.hadm_id
+),
+
+health_scores AS (
+  SELECT DISTINCT
+    p.subject_id,
+    p.hadm_id,
+    fs.SOFA AS FIRST_DAY_SOFA,
+    MAX(sofa.sofa_24hours) AS ICU_SOFA,
+    MAX(gcs.gcs) AS ICU_GCS
+  FROM patients p
+  LEFT JOIN `physionet-data.mimiciv_derived.first_day_sofa` fs ON p.hadm_id = fs.hadm_id
+  LEFT JOIN `physionet-data.mimiciv_icu.icustays` icu ON p.hadm_id = icu.hadm_id
+  LEFT JOIN `physionet-data.mimiciv_derived.sofa` sofa ON icu.stay_id = sofa.stay_id
+  LEFT JOIN `physionet-data.mimiciv_derived.gcs` gcs ON icu.stay_id = gcs.stay_id
+  GROUP BY p.subject_id, p.hadm_id, fs.SOFA
+),
+services AS (
+  SELECT DISTINCT
+    p.subject_id,
+    p.hadm_id,
+    if(s.prev_service is null,true,false) as FIRST_SERVICE_YN,
+    s.transfertime,
+    s.prev_service,
+    s.curr_service,
+  FROM patients p
+  LEFT JOIN `physionet-data.mimiciv_hosp.services` as s on p.hadm_id = s.hadm_id
+),
+admit AS (
+  SELECT DISTINCT
+    pat.subject_id, 
+    pat.hadm_id, 
+    pat.field_name,
+    pat.field_value
+  FROM (
+    SELECT patients.subject_id, poe.hadm_id, poe_detail.poe_id, 
+           poe_detail.field_name, poe_detail.field_value,
+           ROW_NUMBER() OVER (PARTITION BY poe_detail.poe_id ORDER BY patients.subject_id) AS rownum
+    FROM `physionet-data.mimiciv_hosp.patients` patients
+    JOIN `physionet-data.mimiciv_hosp.poe` poe ON patients.subject_id = poe.subject_id
+    JOIN `physionet-data.mimiciv_hosp.poe_detail` poe_detail ON patients.subject_id = poe_detail.subject_id
+    WHERE poe_detail.field_value LIKE '%ICU%'
+  ) pat
+  WHERE rownum = 1
+)
+
+-- Final data pull
+SELECT 
+  p.*,
+  fl.PRE_ICU_ABN_LAB,
+  fl.ICU_ABN_LAB,
+  hs.FIRST_DAY_SOFA,
+  hs.ICU_SOFA,
+  hs.ICU_GCS,
+  adm.field_name AS admission,
+  adm.field_value AS admit_to
+FROM patients p
+LEFT JOIN flag_labs fl ON p.hadm_id = fl.hadm_id
+LEFT JOIN health_scores hs ON p.hadm_id = hs.hadm_id
+LEFT JOIN admit adm ON p.hadm_id = adm.hadm_id;
